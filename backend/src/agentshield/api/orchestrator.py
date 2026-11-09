@@ -1,0 +1,375 @@
+"""Scan Orchestrator for AgentShield AI API Layer.
+
+Coordinates a single end-to-end scan across the pipeline built by the other
+three members, and returns a fully populated `AgentShieldWorkspace`:
+
+    raw file bytes
+        -> IaCTemplate                         (this module)
+        -> ASTNode tree (Terraform only today) 
+        -> RAG context                          (core.knowledge_base )
+        -> VulnerabilityReport                  (agents.analyst)
+        -> list[PatchDiff]                      (agents.remediator)
+        -> AgentShieldWorkspace                 (this module)
+
+The API layer (routers/) only ever talks to `run_scan`; it never has to know
+how the individual agents work.
+"""
+
+from __future__ import annotations
+
+import logging
+import tempfile
+from pathlib import Path
+
+from agentshield.agents import RemediationAgent, SecurityAnalystAgent, ValidatorAgent
+from agentshield.core.llm import LLMClient, LLMConfig, LLMProvider, MultiLLMEnsemble
+from agentshield.core.schemas import (
+    AgentShieldWorkspace,
+    ASTNode,
+    CloudProvider,
+    IaCTemplate,
+    IaCType,
+    RemediationStatus,
+)
+from agentshield.parsers.normalizer import normalize_terraform_resources
+from agentshield.parsers.terraform import extract_terraform_resources, parse_terraform_file
+
+import os
+
+logger = logging.getLogger("agentshield.api.orchestrator")
+
+
+def get_configured_agents() -> tuple[SecurityAnalystAgent, RemediationAgent, ValidatorAgent]:
+    """Dynamically configure SecurityAnalystAgent, RemediationAgent, and ValidatorAgent
+    based on the available environment keys.
+
+    Priority:
+    - Google Gemini (GEMINI_API_KEY / GOOGLE_API_KEY) - Free
+    - OpenRouter (OPENROUTER_API_KEY) - Free
+    - OpenAI (OPENAI_API_KEY)
+    - Anthropic (ANTHROPIC_API_KEY)
+    - Mock fallback for offline demonstration
+    """
+    clients: list[LLMClient] = []
+
+    gemini_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+    openrouter_key = os.getenv("OPENROUTER_API_KEY")
+    openai_key = os.getenv("OPENAI_API_KEY")
+    anthropic_key = os.getenv("ANTHROPIC_API_KEY")
+
+    if gemini_key:
+        clients.append(
+            LLMClient(
+                LLMConfig(
+                    provider=LLMProvider.GEMINI,
+                    model_name=os.getenv("GEMINI_MODEL", "gemini-2.0-flash"),
+                )
+            )
+        )
+
+    if openrouter_key:
+        clients.append(
+            LLMClient(
+                LLMConfig(
+                    provider=LLMProvider.OPENROUTER,
+                    model_name=os.getenv("OPENROUTER_MODEL", "meta-llama/llama-3.3-70b-instruct:free"),
+                )
+            )
+        )
+
+    if openai_key:
+        clients.append(
+            LLMClient(
+                LLMConfig(
+                    provider=LLMProvider.OPENAI,
+                    model_name=os.getenv("OPENAI_MODEL", "gpt-4o"),
+                )
+            )
+        )
+
+    if anthropic_key:
+        clients.append(
+            LLMClient(
+                LLMConfig(
+                    provider=LLMProvider.ANTHROPIC,
+                    model_name=os.getenv("ANTHROPIC_MODEL", "claude-3-5-sonnet-20241022"),
+                )
+            )
+        )
+
+    # If only 1 client is configured, add a diverse second model to form a true multi-LLM ensemble
+    if len(clients) == 1:
+        primary = clients[0]
+        if primary.config.provider == LLMProvider.GEMINI:
+            secondary_model = (
+                "gemini-1.5-flash" if "2.0" in primary.config.model_name else "gemini-2.0-flash"
+            )
+            clients.append(
+                LLMClient(
+                    LLMConfig(
+                        provider=LLMProvider.GEMINI,
+                        model_name=secondary_model,
+                    )
+                )
+            )
+        elif primary.config.provider == LLMProvider.OPENROUTER:
+            clients.append(
+                LLMClient(
+                    LLMConfig(
+                        provider=LLMProvider.OPENROUTER,
+                        model_name="google/gemini-2.0-flash-exp:free",
+                    )
+                )
+            )
+        elif primary.config.provider == LLMProvider.OPENAI:
+            clients.append(
+                LLMClient(
+                    LLMConfig(
+                        provider=LLMProvider.OPENAI,
+                        model_name="gpt-4o-mini",
+                    )
+                )
+            )
+        elif primary.config.provider == LLMProvider.ANTHROPIC:
+            clients.append(
+                LLMClient(
+                    LLMConfig(
+                        provider=LLMProvider.ANTHROPIC,
+                        model_name="claude-3-haiku-20240307",
+                    )
+                )
+            )
+
+    # Fallback to Mock if no keys configured
+    if not clients:
+        clients = [
+            LLMClient(LLMConfig(provider=LLMProvider.MOCK, model_name="mock-analyst-1")),
+            LLMClient(LLMConfig(provider=LLMProvider.MOCK, model_name="mock-analyst-2")),
+        ]
+
+    ensemble = MultiLLMEnsemble(clients=clients)
+    analyst = SecurityAnalystAgent(ensemble=ensemble)
+    remediator = RemediationAgent(llm_client=clients[0])
+    validator = ValidatorAgent()
+
+    return analyst, remediator, validator
+
+
+_analyst, _remediator, _validator = get_configured_agents()
+
+
+
+def _detect_cloud_provider(raw_content: str) -> CloudProvider:
+    lowered = raw_content.lower()
+    if "aws_" in lowered or "provider \"aws\"" in lowered:
+        return CloudProvider.AWS
+    if "azurerm_" in lowered or "provider \"azurerm\"" in lowered:
+        return CloudProvider.AZURE
+    if "google_" in lowered or "provider \"google\"" in lowered:
+        return CloudProvider.GCP
+    return CloudProvider.UNKNOWN
+
+
+def _build_terraform_ast(file_path: str, resources: list[dict]) -> ASTNode:
+    """Convert Member 1's normalized resource dicts into an ASTNode tree."""
+    children: list[ASTNode] = []
+    for res in resources:
+        start = res.get("start_line")
+        end = res.get("end_line")
+        line_range = None
+        if isinstance(start, int) and isinstance(end, int) and end >= start:
+            from agentshield.core.schemas import LineRange
+
+            line_range = LineRange(start_line=start, end_line=end)
+
+        children.append(
+            ASTNode(
+                node_id=res["resource_id"],
+                node_type="resource",
+                resource_type=res.get("resource_type"),
+                name=res.get("resource_name", res["resource_id"]),
+                attributes=res.get("properties", {}),
+                line_range=line_range,
+                parent_id="root",
+            )
+        )
+
+    return ASTNode(
+        node_id="root",
+        node_type="module",
+        name=Path(file_path).stem,
+        children=children,
+    )
+
+
+def build_iac_template(filename: str, raw_bytes: bytes) -> IaCTemplate:
+    """Parse an uploaded IaC file into an IaCTemplate (+ AST when supported)."""
+    raw_content = raw_bytes.decode("utf-8", errors="replace")
+
+    template = IaCTemplate(
+        file_path=filename,
+        raw_content=raw_content,
+        cloud_provider=_detect_cloud_provider(raw_content),
+    )
+    template.auto_detect_type()
+
+    if template.iac_type == IaCType.TERRAFORM:
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".tf", delete=False, encoding="utf-8"
+        ) as tmp:
+            tmp.write(raw_content)
+            tmp_path = tmp.name
+        try:
+            parsed = parse_terraform_file(tmp_path)
+            resources = normalize_terraform_resources(extract_terraform_resources(parsed))
+            template.parsed_ast = _build_terraform_ast(filename, resources)
+        except Exception:
+            logger.exception("Terraform parsing failed for %s; continuing without AST", filename)
+        finally:
+            Path(tmp_path).unlink(missing_ok=True)
+    else:
+        logger.info(
+            "AST parsing for iac_type=%s is not implemented yet; analyzing raw content only.",
+            template.iac_type,
+        )
+
+    return template
+
+
+def _retrieve_rag_context(template: IaCTemplate) -> list[str]:
+    """Best-effort RAG context lookup. Degrades gracefully if the vector DB
+        hasn't been built yet in this environment,
+    so scanning still works without the knowledge base being present."""
+    try:
+        from agentshield.core.knowledge_base import retrieve_context
+
+        query = f"Security best practices for {template.iac_type.value} {template.cloud_provider.value} infrastructure"
+        result = retrieve_context(query, top_k=5)
+        return [result["context"]] if result.get("context") else []
+    except Exception:
+        logger.warning(
+            "RAG context retrieval unavailable (knowledge base not built or Qdrant "
+            "unreachable) — proceeding with analysis without retrieved context."
+        )
+        return []
+
+
+def run_scan(filename: str, raw_bytes: bytes) -> AgentShieldWorkspace:
+    """Execute the full scan -> analyze -> remediate pipeline for one uploaded file."""
+    analyst, remediator, validator = get_configured_agents()
+    template = build_iac_template(filename, raw_bytes)
+
+    workspace = AgentShieldWorkspace(template=template, status="PARSED")
+    workspace.execution_logs.append(
+        {"agent": "Orchestrator", "action": "parsed_template", "iac_type": template.iac_type.value}
+    )
+
+    context_docs = _retrieve_rag_context(template)
+    workspace.active_agent = "SecurityAnalystAgent"
+    report = analyst.analyze(template, context_docs=context_docs or None)
+    workspace.report = report
+    workspace.status = "ANALYZED"
+    workspace.execution_logs.append(
+        {
+            "agent": "SecurityAnalystAgent",
+            "action": "analyzed",
+            "findings": len(report.findings),
+            "risk_score": report.summary.risk_score,
+        }
+    )
+
+    # Task 3.3: Attack-Path & Blast-Radius Prioritization Engine
+    try:
+        from agentshield.core.attack_path import FindingPrioritizer, ResourceGraph
+
+        workspace.active_agent = "FindingPrioritizer"
+        resource_graph = ResourceGraph.from_template(template)
+        prioritizer = FindingPrioritizer(resource_graph)
+        report.findings = prioritizer.rank_findings(report.findings)
+        report.recalculate_summary()
+
+        attack_graph_data = resource_graph.get_graph()
+        attack_graph_data["entry_points"] = prioritizer.path_analyzer.find_entry_points()
+        attack_graph_data["choke_points"] = prioritizer.path_analyzer.find_choke_points()
+        attack_graph_data["mermaid"] = resource_graph.to_mermaid()
+        workspace.attack_graph = attack_graph_data
+
+        attack_paths_count = sum(1 for f in report.findings if f.attack_path)
+        workspace.execution_logs.append(
+            {
+                "agent": "FindingPrioritizer",
+                "action": "prioritized_findings",
+                "findings_count": len(report.findings),
+                "attack_paths_detected": attack_paths_count,
+                "entry_points_count": len(attack_graph_data["entry_points"]),
+                "graph_nodes": len(resource_graph),
+            }
+        )
+    except Exception:
+        logger.exception("Attack-path prioritization failed; continuing with unranked findings")
+
+    workspace.active_agent = "RemediationAgent"
+    actionable = [f for f in report.findings if f.rule_id != "AS-INFO-000"]
+    patches = remediator.generate_patches(template, report.model_copy(update={"findings": actionable}))
+    workspace.patches = patches
+    workspace.status = "REMEDIATED"
+    workspace.execution_logs.append(
+        {
+            "agent": "RemediationAgent",
+            "action": "patches_generated",
+            "count": len(patches),
+            "auto_patchable_count": report.summary.auto_patchable_count,
+            "human_review_count": report.summary.human_review_count,
+        }
+    )
+
+    # Task 4.2: Code & Sandbox Validator Agent — Static Linters
+    workspace.active_agent = "ValidatorAgent"
+    try:
+        validated_patches = validator.validate_patches(
+            template=template,
+            patches=patches,
+            report=report,
+            remediator=remediator,
+        )
+        workspace.patches = validated_patches
+        validated_count = sum(
+            1 for p in validated_patches if p.remediation_status == RemediationStatus.SYNTAX_VALIDATED
+        )
+        failed_count = sum(
+            1 for p in validated_patches if p.remediation_status == RemediationStatus.FAILED
+        )
+        workspace.execution_logs.append(
+            {
+                "agent": "ValidatorAgent",
+                "action": "static_lint_validation",
+                "total_patches": len(validated_patches),
+                "syntax_validated_count": validated_count,
+                "failed_count": failed_count,
+            }
+        )
+    except Exception:
+        logger.exception("Static lint validation failed; continuing with unvalidated patches")
+
+    workspace.active_agent = None
+
+
+    # Task 3.4: Automated Escalation to Human Security Audit Queue
+    try:
+        from agentshield.core.audit import audit_queue_manager
+
+        enqueued = audit_queue_manager.evaluate_and_enqueue(workspace)
+        if enqueued:
+            workspace.execution_logs.append(
+                {
+                    "agent": "HumanAuditQueue",
+                    "action": "enqueued_for_human_review",
+                    "count": len(enqueued),
+                    "items": [item.item_id for item in enqueued],
+                }
+            )
+    except Exception:
+        logger.exception("Failed to enqueue findings to Human Security Audit Queue")
+
+    return workspace
